@@ -3,8 +3,15 @@
 # org files are not deleted.
 set -euo pipefail
 
+RELEASE_TAG="catalogue-latest"
+ORG_ZIP_URL="https://recasaos.org/store/recasaos.zip"
+GITHUB_ZIP_URL="https://github.com/ReCasaOS/_appstore/releases/latest/download/recasaos.zip"
+CATALOGUE_BRANCH_ZIP_URL="https://raw.githubusercontent.com/ReCasaOS/_appstore/catalogue/store/recasaos.zip"
+
 usage() {
   echo "usage: publish.sh --artifacts DIR --org DIR [--github CMD] [--readme PATH] [--org-push CMD]" >&2
+  echo "       publish.sh --fetch-previous PATH" >&2
+  echo "       publish.sh --skip-if-published --artifacts DIR" >&2
   exit 2
 }
 
@@ -14,6 +21,8 @@ github=""
 readme=""
 org_push=""
 have_github=0
+fetch_previous=""
+skip_if_published=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -22,10 +31,63 @@ while [[ $# -gt 0 ]]; do
     --github) github="${2:-}"; have_github=1; shift 2 ;;
     --readme) readme="${2:-}"; shift 2 ;;
     --org-push) org_push="${2:-}"; shift 2 ;;
+    --fetch-previous) fetch_previous="${2:-}"; shift 2 ;;
+    --skip-if-published) skip_if_published=1; shift ;;
     -h|--help) usage ;;
     *) echo "unknown arg: $1" >&2; usage ;;
   esac
 done
+
+fetch_previous_zip() {
+  local dest="$1" url
+  [[ -n "$dest" ]] || return 2
+  rm -f "$dest"
+  for url in "$ORG_ZIP_URL" "$GITHUB_ZIP_URL" "$CATALOGUE_BRANCH_ZIP_URL"; do
+    if curl -fsSL -o "$dest" "$url"; then
+      echo "previous catalogue from $url"
+      return 0
+    fi
+    rm -f "$dest"
+  done
+  echo "no published catalogue yet"
+  return 0
+}
+
+already_on_both_hosts() {
+  local zip="$1" org_tmp gh_tmp
+  [[ -f "$zip" ]] || return 1
+  org_tmp="$(mktemp)"
+  gh_tmp="$(mktemp)"
+  if ! curl -fsSL -o "$org_tmp" "$ORG_ZIP_URL"; then
+    rm -f "$org_tmp" "$gh_tmp"
+    return 1
+  fi
+  if ! curl -fsSL -o "$gh_tmp" "$GITHUB_ZIP_URL"; then
+    rm -f "$org_tmp" "$gh_tmp"
+    return 1
+  fi
+  if cmp -s "$org_tmp" "$zip" && cmp -s "$gh_tmp" "$zip"; then
+    rm -f "$org_tmp" "$gh_tmp"
+    return 0
+  fi
+  rm -f "$org_tmp" "$gh_tmp"
+  return 1
+}
+
+if [[ -n "$fetch_previous" ]]; then
+  fetch_previous_zip "$fetch_previous"
+  exit 0
+fi
+
+if [[ "$skip_if_published" -eq 1 ]]; then
+  [[ -n "$artifacts" ]] || usage
+  artifacts="$(cd "$artifacts" && pwd)"
+  if already_on_both_hosts "$artifacts/recasaos.zip"; then
+    echo "org and GitHub already hold this zip"
+    exit 0
+  fi
+  exit 1
+fi
 
 [[ -n "$artifacts" && -n "$org" ]] || usage
 
@@ -78,6 +140,12 @@ github_failed() {
   exit 1
 }
 
+stage_blob() {
+  local src="$1" dest="$2" blob
+  blob="$(git hash-object -w "$src")" || return 1
+  git update-index --add --cacheinfo "100644,${blob},${dest}" || return 1
+}
+
 publish_github_release_and_branch() {
   local zip="$artifacts/recasaos.zip"
   local sha="$artifacts/recasaos.zip.sha256"
@@ -90,44 +158,43 @@ publish_github_release_and_branch() {
     echo "no GitHub assets under $artifacts" >&2
     return 1
   fi
-  if gh release view catalogue >/dev/null 2>&1; then
-    gh release upload catalogue "${assets[@]}" --clobber
+  if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+    gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber || return 1
   else
-    gh release create catalogue "${assets[@]}" --latest \
+    gh release create "$RELEASE_TAG" "${assets[@]}" --latest \
       --title "ReCasaOS catalogue" \
-      --notes "Rolling catalogue. Same bytes as https://recasaos.org/store/recasaos.zip"
+      --notes "Rolling catalogue. Same bytes as https://recasaos.org/store/recasaos.zip" \
+      || return 1
   fi
 
   (
-    cd "$repo_root"
+    cd "$repo_root" || exit 1
     export GIT_INDEX_FILE
     GIT_INDEX_FILE="$(mktemp -u)"
-    git update-index --add --cacheinfo "100644,$(git hash-object -w "$zip"),store/recasaos.zip"
+    stage_blob "$zip" "store/recasaos.zip" || exit 1
     if [[ -f "$index" ]]; then
-      git update-index --add --cacheinfo "100644,$(git hash-object -w "$index"),store/store-index.json"
+      stage_blob "$index" "store/store-index.json" || exit 1
     fi
     if [[ -f "$sha" ]]; then
-      git update-index --add --cacheinfo "100644,$(git hash-object -w "$sha"),store/recasaos.zip.sha256"
+      stage_blob "$sha" "store/recasaos.zip.sha256" || exit 1
     fi
     if [[ -n "$readme" && -f "$readme" ]]; then
-      git update-index --add --cacheinfo "100644,$(git hash-object -w "$readme"),README.md"
+      stage_blob "$readme" "README.md" || exit 1
     fi
-    local apps="?"
-    apps="$(unzip -p "$zip" catalogue.json | python -c 'import json,sys; print(len(json.load(sys.stdin)["apps"]))')"
-    local commit
-    commit="$(git commit-tree "$(git write-tree)" -m "Catalogue of $(date -u +%Y-%m-%d), ${apps} apps")"
-    git push --force --quiet origin "${commit}:refs/heads/catalogue"
+    local apps tree commit
+    apps="$(unzip -p "$zip" catalogue.json | python -c 'import json,sys; print(len(json.load(sys.stdin)["apps"]))')" || exit 1
+    tree="$(git write-tree)" || exit 1
+    commit="$(git commit-tree "$tree" -m "Catalogue of $(date -u +%Y-%m-%d), ${apps} apps")" || exit 1
+    git push --force --quiet origin "${commit}:refs/heads/catalogue" || exit 1
     echo "catalogue is now the build of $(date -u +%Y-%m-%d), ${apps} apps"
-  )
+  ) || return 1
 }
 
 write_org
 push_org
 
 if [[ "$have_github" -eq 1 ]]; then
-  if ! bash -c "$github"; then
-    github_failed
-  fi
-elif ! publish_github_release_and_branch; then
-  github_failed
+  bash -c "$github" || github_failed
+else
+  publish_github_release_and_branch || github_failed
 fi

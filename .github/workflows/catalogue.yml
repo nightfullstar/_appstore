@@ -3,8 +3,8 @@ name: catalogue
 # The ReCasaOS app catalogue: IceWhale's store, the RoqueOS list and the Big Bear
 # fork merged into one CasaOS store (catalogue/build.py, documented in README.md).
 # After a green merge, catalogue/publish.sh writes recasaos.org/store/ first, then
-# the same bytes to a rolling GitHub Release (tag `catalogue`) and the `catalogue`
-# branch. A GitHub failure is logged; the org files are not deleted.
+# the same bytes to a rolling GitHub Release (tag `catalogue-latest`, --latest) and
+# the `catalogue` branch. A GitHub failure is logged; the org files are not deleted.
 #
 #   https://recasaos.org/store/recasaos.zip
 #   https://github.com/ReCasaOS/_appstore/releases/latest/download/recasaos.zip
@@ -56,7 +56,7 @@ jobs:
           (git clone -q --depth 1 --filter=blob:none --no-checkout https://github.com/roqueribeiro/roqueos-containers-list src/roqueos \
             && git -C src/roqueos sparse-checkout set --no-cone '/Apps/*/docker-compose.yml' \
             && git -C src/roqueos checkout -q) || echo "::warning::roqueos did not download"
-          curl -fsSL -o prev.zip https://raw.githubusercontent.com/ReCasaOS/_appstore/catalogue/store/recasaos.zip || rm -f prev.zip
+          bash catalogue/publish.sh --fetch-previous prev.zip
           ls -la prev.zip 2>/dev/null || echo "no published catalogue yet"
 
       - name: Merge
@@ -72,8 +72,8 @@ jobs:
           RECASAOS_ORG_TOKEN: ${{ secrets.RECASAOS_ORG_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -f prev.zip ] && cmp -s prev.zip out/store/recasaos.zip; then
-            echo "catalogue already holds this zip"
+          if bash catalogue/publish.sh --skip-if-published --artifacts out/store; then
+            echo "org and GitHub already hold this zip"
             exit 0
           fi
           : "${RECASAOS_ORG_TOKEN:?set secret RECASAOS_ORG_TOKEN (PAT that can push to ReCasaOS/recasaos.org)}"

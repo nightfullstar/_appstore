@@ -49,7 +49,7 @@ The nightly copy on `main` is IceWhale's work, unedited; [`ReCasaOS/CasaOS-AppMa
 
 ## Publishing
 
-After a green merge, `.github/workflows/catalogue.yml` runs `catalogue/publish.sh`: it writes `store/recasaos.zip`, `store/recasaos.zip.sha256`, `store/store-index.json`, and `store/health` (`ok`) on [recasaos.org](https://recasaos.org/store/), then uploads the same three artifacts to the rolling GitHub Release tagged `catalogue` and updates the `catalogue` branch. If GitHub fails, the org files stay; they are not deleted.
+After a green merge, `.github/workflows/catalogue.yml` runs `catalogue/publish.sh`: it writes `store/recasaos.zip`, `store/recasaos.zip.sha256`, `store/store-index.json`, and `store/health` (`ok`) on [recasaos.org](https://recasaos.org/store/), then uploads the same three artifacts to the rolling GitHub Release tagged `catalogue-latest` (`--latest`, so `releases/latest/download/recasaos.zip` still works) and updates the `catalogue` branch. The release tag is not `catalogue`, so `refs/heads/catalogue` stays unambiguous for `raw.githubusercontent.com/.../catalogue/store/recasaos.zip`. Carry-over and revision read the org zip first (then the GitHub Release, then the `catalogue` branch). Publish is skipped only when both the org zip and the GitHub Release zip already match the new zip, so a failed GitHub step is retried on the next run. If GitHub fails, the org files stay; they are not deleted.
 
 Do not put tokens in the repository. This workflow needs one secret:
 
