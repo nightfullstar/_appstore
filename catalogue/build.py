@@ -9,7 +9,7 @@ A --src directory is any tree holding an `Apps/<dir>/docker-compose.yml` layout
 that is missing or empty is carried over from --previous, so one dead source
 never empties the store; a merge that shrinks sharply raises Refused.
 """
-import argparse, concurrent.futures, hashlib, io, json, re, sys, urllib.error, urllib.parse, urllib.request, zipfile
+import argparse, concurrent.futures, hashlib, http.client, io, json, re, sys, urllib.error, urllib.request, zipfile
 from pathlib import Path
 
 import yaml
@@ -162,7 +162,9 @@ def dump(obj):
 
 
 def asset_ext(url, content_type, body):
-    """png/jpg/webp/svg from Content-Type, magic, or URL path; None when the bytes are not an icon."""
+    """png/jpg/webp/svg from Content-Type or magic/SVG; None when the bytes are not an icon."""
+    if not body:
+        return None
     ctype = (content_type or "").split(";", 1)[0].strip().lower()
     if ctype in ASSET_TYPES:
         return ASSET_TYPES[ctype]
@@ -175,10 +177,6 @@ def asset_ext(url, content_type, body):
     head = body.lstrip()[:256].lower()
     if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head):
         return "svg"
-    path = urllib.parse.urlparse(url).path.lower()
-    for ext in ("png", "jpg", "jpeg", "webp", "svg"):
-        if path.endswith("." + ext):
-            return "jpg" if ext == "jpeg" else ext
     return None
 
 
@@ -206,7 +204,7 @@ def fetch_asset(url, cap, timeout=10):
                 if len(buf) > cap:
                     return None
             body = bytes(buf)
-    except (OSError, ValueError, urllib.error.URLError):
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException):
         return None
     ext = asset_ext(url, ctype, body)
     return (body, ext) if ext else None
@@ -252,6 +250,14 @@ def inline_assets(app_id, raw, prev_files, fetch):
         casa["screenshot_link"] = new
     if changed:
         raw = yaml.safe_dump(doc, sort_keys=False, allow_unicode=True).encode()
+    keep = set()
+    icon = casa.get("icon")
+    if isinstance(icon, str) and icon and not icon.startswith(("http://", "https://")):
+        keep.add(icon)
+    shots = casa.get("screenshot_link")
+    if isinstance(shots, list):
+        keep.update(s for s in shots if isinstance(s, str) and s and not s.startswith(("http://", "https://")))
+    assets = {p: d for p, d in assets.items() if p[len(prefix):] in keep}
     return raw, assets
 
 

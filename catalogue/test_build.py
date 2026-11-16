@@ -214,6 +214,54 @@ class StorePublish(unittest.TestCase):
         self.assertEqual(files2["Apps/y/icon.png"], PNG)
         self.assertEqual(files2["Apps/y/docker-compose.yml"], files["Apps/y/docker-compose.yml"])
 
+    def test_html_and_gif_payloads_are_omitted_and_the_app_is_kept(self):
+        html = b"<!DOCTYPE html><html><body>soft 404</body></html>"
+        gif = b"GIF89a" + b"\x00" * 32
+        with asset_server({
+            "/icon.png": (html, "text/html"),
+            "/gif.png": (gif, "image/gif"),
+            "/empty.png": (b"", "image/png"),
+        }) as base:
+            files, rep = run_merge({"a": src(
+                ("htmlapp", {"icon": f"{base}/icon.png"}),
+                ("gifapp", {"icon": f"{base}/gif.png"}),
+                ("emptyapp", {"icon": f"{base}/empty.png"}),
+            )})
+        self.assertEqual(sorted(a["id"] for a in rep["apps"]), ["emptyapp", "gifapp", "htmlapp"])
+        for app in ("htmlapp", "gifapp", "emptyapp"):
+            self.assertFalse(
+                any(p.rsplit("/", 1)[-1].startswith("icon.") for p in files if p.startswith(f"Apps/{app}/")),
+                app,
+            )
+            self.assertEqual(yaml.safe_load(files[f"Apps/{app}/docker-compose.yml"])["x-casaos"]["icon"], "")
+
+    def test_malformed_icon_url_keeps_the_app(self):
+        try:
+            files, rep = run_merge({"a": src(("immich", {"icon": "http://127.0.0.1:abc/icon.png"}))})
+        except Exception as e:
+            self.fail(f"merge aborted: {type(e).__name__}: {e}")
+        self.assertEqual([a["id"] for a in rep["apps"]], ["immich"])
+        self.assertFalse(any(p.rsplit("/", 1)[-1].startswith("icon.") for p in files if p.startswith("Apps/immich/")))
+        self.assertEqual(yaml.safe_load(files["Apps/immich/docker-compose.yml"])["x-casaos"]["icon"], "")
+
+    def test_dropped_icon_and_screenshots_do_not_keep_previous_files(self):
+        shot = b"\x89PNG\r\n\x1a\n" + b"shot"
+        with asset_server({"/icon.png": (PNG, "image/png"), "/shot.png": (shot, "image/png")}) as base:
+            files, _ = run_merge({"a": src(("immich", {
+                "icon": f"{base}/icon.png",
+                "screenshots": [f"{base}/shot.png"],
+            }))})
+        self.assertIn("Apps/immich/icon.png", files)
+        self.assertIn("Apps/immich/screenshot-1.png", files)
+        prev = {
+            "manifest": {"apps": [{"id": "immich", "source": "a"}]},
+            "files": files,
+        }
+        files2, rep = run_merge({"a": src(("immich", {}))}, prev)
+        self.assertEqual([a["id"] for a in rep["apps"]], ["immich"])
+        self.assertNotIn("Apps/immich/icon.png", files2)
+        self.assertNotIn("Apps/immich/screenshot-1.png", files2)
+
     def test_revision_starts_at_1_and_bumps_when_compose_hash_changes(self):
         files, rep = run_merge({"a": src(("immich", {}))})
         index = build.store_index(files, rep)
