@@ -2,14 +2,16 @@ name: catalogue
 
 # The ReCasaOS app catalogue: IceWhale's store, the RoqueOS list and the Big Bear
 # fork merged into one CasaOS store (catalogue/build.py, documented in README.md).
-# The result is one commit on the `catalogue` branch, remade only when the zip
-# changes, served at
+# After a green merge, catalogue/publish.sh writes recasaos.org/store/ first, then
+# the same bytes to a rolling GitHub Release (tag `catalogue`) and the `catalogue`
+# branch. A GitHub failure is logged; the org files are not deleted.
 #
-#   https://raw.githubusercontent.com/ReCasaOS/_appstore/catalogue/store/recasaos.zip
+#   https://recasaos.org/store/recasaos.zip
+#   https://github.com/ReCasaOS/_appstore/releases/latest/download/recasaos.zip
 #
 # A pull request runs the tests and the whole build without publishing. A build
 # the script refuses (too few apps, or a sharp drop against the published one)
-# fails the run and leaves `catalogue` as it was.
+# fails the run and leaves both hosts as they were.
 
 on:
   schedule:
@@ -39,6 +41,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: pip install pyyaml
       - run: python catalogue/test_build.py
+      - run: python catalogue/test_publish.py
 
       # A source that fails to download is left out here; build.py then carries
       # its apps over from the published catalogue instead of losing them.
@@ -64,16 +67,15 @@ jobs:
 
       - name: Publish
         if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECASAOS_ORG_TOKEN: ${{ secrets.RECASAOS_ORG_TOKEN }}
         run: |
           set -euo pipefail
           if [ -f prev.zip ] && cmp -s prev.zip out/store/recasaos.zip; then
             echo "catalogue already holds this zip"
             exit 0
           fi
-          export GIT_INDEX_FILE="$(mktemp -u)"
-          git update-index --add --cacheinfo "100644,$(git hash-object -w out/store/recasaos.zip),store/recasaos.zip"
-          git update-index --add --cacheinfo "100644,$(git hash-object -w out/README.md),README.md"
-          apps="$(unzip -p out/store/recasaos.zip catalogue.json | python -c 'import json,sys; print(len(json.load(sys.stdin)["apps"]))')"
-          commit="$(git commit-tree "$(git write-tree)" -m "Catalogue of $(date -u +%Y-%m-%d), ${apps} apps")"
-          git push --force --quiet origin "${commit}:refs/heads/catalogue"
-          echo "catalogue is now the build of $(date -u +%Y-%m-%d), ${apps} apps"
+          : "${RECASAOS_ORG_TOKEN:?set secret RECASAOS_ORG_TOKEN (PAT that can push to ReCasaOS/recasaos.org)}"
+          git clone --depth 1 "https://x-access-token:${RECASAOS_ORG_TOKEN}@github.com/ReCasaOS/recasaos.org.git" org-site
+          bash catalogue/publish.sh --artifacts out/store --org org-site --readme out/README.md

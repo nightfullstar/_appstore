@@ -15,8 +15,10 @@ This repository builds and serves the app catalogue of ReCasaOS, so that a box d
 | `main` | a byte-for-byte nightly copy of IceWhale's `store/main.zip`, the fallback of boxes that still name IceWhale's URL |
 
 ```
-https://raw.githubusercontent.com/ReCasaOS/_appstore/catalogue/store/recasaos.zip
+https://recasaos.org/store/recasaos.zip
 ```
+
+GitHub is the mirror: `https://github.com/ReCasaOS/_appstore/releases/latest/download/recasaos.zip`. The `catalogue` branch still holds the zip and `store-index.json` for history.
 
 ## The catalogue
 
@@ -41,6 +43,31 @@ Not used: `jborgwardt/appstore` is in Umbrel's format and carries no licence, so
 4. **A shrinking catalogue is not published**: the run fails, and `catalogue` stays as it was, if the merge has fewer than 250 apps or fewer than 90 % of the published count.
 5. **Same bytes, no commit**: the zip is deterministic, so an unchanged catalogue does not touch the branch.
 
-Run `python catalogue/test_build.py` for the tests; `python catalogue/build.py --help` for a local build. Adding a source is an entry in `catalogue/sources.json`, its licence text in `catalogue/licenses/<id>.txt`, and a fetch line in `.github/workflows/catalogue.yml`.
+Run `python catalogue/test_build.py` and `python catalogue/test_publish.py` for the tests; `python catalogue/build.py --help` for a local build. Adding a source is an entry in `catalogue/sources.json`, its licence text in `catalogue/licenses/<id>.txt`, and a fetch line in `.github/workflows/catalogue.yml`.
 
 The nightly copy on `main` is IceWhale's work, unedited; [`ReCasaOS/CasaOS-AppManagement`](https://github.com/ReCasaOS/CasaOS-AppManagement) falls back to it when IceWhale's URL stops answering.
+
+## Publishing
+
+After a green merge, `.github/workflows/catalogue.yml` runs `catalogue/publish.sh`: it writes `store/recasaos.zip`, `store/recasaos.zip.sha256`, `store/store-index.json`, and `store/health` (`ok`) on [recasaos.org](https://recasaos.org/store/), then uploads the same three artifacts to the rolling GitHub Release tagged `catalogue` and updates the `catalogue` branch. If GitHub fails, the org files stay; they are not deleted.
+
+Do not put tokens in the repository. This workflow needs one secret:
+
+- **`RECASAOS_ORG_TOKEN`** — a PAT (or fine-grained token with Contents: Read and write on `ReCasaOS/recasaos.org`) that can push to that repo. `GITHUB_TOKEN` cannot. The job uses the default `GITHUB_TOKEN` for the Release and the `catalogue` branch.
+
+### Manual proof: sha256 equal on both hosts
+
+After a publish, the four hex digests must match. GitHub Pages can lag a minute; this is not a CI check.
+
+```sh
+curl -fsSL https://recasaos.org/store/recasaos.zip.sha256
+curl -fsSL https://github.com/ReCasaOS/_appstore/releases/latest/download/recasaos.zip.sha256
+curl -fsSL https://recasaos.org/store/recasaos.zip | sha256sum
+curl -fsSL https://github.com/ReCasaOS/_appstore/releases/latest/download/recasaos.zip | sha256sum
+```
+
+`store/health` is `ok` when the zip and index are present:
+
+```sh
+curl -fsSL https://recasaos.org/store/health
+```
