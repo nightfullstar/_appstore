@@ -9,7 +9,7 @@ A --src directory is any tree holding an `Apps/<dir>/docker-compose.yml` layout
 that is missing or empty is carried over from --previous, so one dead source
 never empties the store; a merge that shrinks sharply raises Refused.
 """
-import argparse, concurrent.futures, io, json, re, sys, urllib.error, urllib.request, zipfile
+import argparse, concurrent.futures, hashlib, io, json, re, sys, urllib.error, urllib.parse, urllib.request, zipfile
 from pathlib import Path
 
 import yaml
@@ -27,6 +27,16 @@ MANIFEST_TYPES = ",".join([
     "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json", "application/vnd.docker.distribution.manifest.v2+json",
 ])
+STORE_SCHEMA = "recasaos.store-index.v1"
+STORE_ID = "recasaos-catalogue"
+STORE_URL = "https://recasaos.org/store/recasaos.zip"
+STORE_MIRROR = "https://github.com/ReCasaOS/_appstore/releases/latest/download/recasaos.zip"
+ICON_MAX = 128 * 1024
+SHOT_MAX = 512 * 1024
+ASSET_TYPES = {
+    "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+    "image/webp": "webp", "image/svg+xml": "svg",
+}
 
 
 class Refused(Exception):
@@ -151,7 +161,101 @@ def dump(obj):
     return (json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode()
 
 
-def merge(sources, loaded, previous, check_image, min_ratio=0.9, min_apps=250):
+def asset_ext(url, content_type, body):
+    """png/jpg/webp/svg from Content-Type, magic, or URL path; None when the bytes are not an icon."""
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    if ctype in ASSET_TYPES:
+        return ASSET_TYPES[ctype]
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if body.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return "webp"
+    head = body.lstrip()[:256].lower()
+    if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head):
+        return "svg"
+    path = urllib.parse.urlparse(url).path.lower()
+    for ext in ("png", "jpg", "jpeg", "webp", "svg"):
+        if path.endswith("." + ext):
+            return "jpg" if ext == "jpeg" else ext
+    return None
+
+
+def fetch_asset(url, cap, timeout=10):
+    """(bytes, ext) for an http(s) image within cap, else None."""
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return None
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            ctype = r.headers.get("Content-Type", "")
+            cl = r.headers.get("Content-Length")
+            if cl is not None:
+                try:
+                    if int(cl) > cap:
+                        return None
+                except ValueError:
+                    pass
+            buf = bytearray()
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > cap:
+                    return None
+            body = bytes(buf)
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+    ext = asset_ext(url, ctype, body)
+    return (body, ext) if ext else None
+
+
+def inline_assets(app_id, raw, prev_files, fetch):
+    """Fetch http(s) icons/screenshots into the zip and rewrite x-casaos to relative names."""
+    prefix = f"Apps/{app_id}/"
+    assets = {p: d for p, d in prev_files.items()
+              if p.startswith(prefix) and p[len(prefix):] not in ("docker-compose.yml", "docker-compose.yaml")}
+    doc, _ = check_compose(raw)
+    casa = doc["x-casaos"]
+    changed = False
+    icon = casa.get("icon")
+    if isinstance(icon, str) and icon.startswith(("http://", "https://")):
+        changed = True
+        for p in [p for p in assets if p[len(prefix):].startswith("icon.")]:
+            del assets[p]
+        got = fetch(icon, ICON_MAX)
+        if got:
+            body, ext = got
+            assets[prefix + "icon." + ext] = body
+            casa["icon"] = "icon." + ext
+        else:
+            casa["icon"] = ""
+    shots = casa.get("screenshot_link")
+    if isinstance(shots, list) and any(isinstance(s, str) and s.startswith(("http://", "https://")) for s in shots):
+        changed = True
+        for p in [p for p in assets if p[len(prefix):].startswith("screenshot-")]:
+            del assets[p]
+        new, n = [], 1
+        for s in shots:
+            if not isinstance(s, str) or not s.startswith(("http://", "https://")):
+                continue
+            got = fetch(s, SHOT_MAX)
+            if not got:
+                continue
+            body, ext = got
+            name = f"screenshot-{n}.{ext}"
+            assets[prefix + name] = body
+            new.append(name)
+            n += 1
+        casa["screenshot_link"] = new
+    if changed:
+        raw = yaml.safe_dump(doc, sort_keys=False, allow_unicode=True).encode()
+    return raw, assets
+
+
+def merge(sources, loaded, previous, check_image, min_ratio=0.9, min_apps=250, fetch=None):
     """-> (files {path: bytes}, report). `loaded` {source id: find_apps() result or None}; `previous` the last
     published catalogue as {"manifest": dict, "files": {path: bytes}} or None."""
     prev_files = (previous or {}).get("files", {})
@@ -193,13 +297,24 @@ def merge(sources, loaded, previous, check_image, min_ratio=0.9, min_apps=250):
     if len(apps) < min_apps or (prev_count and len(apps) < min_ratio * prev_count):
         raise Refused(f"{len(apps)} apps after the merge, {prev_count} before: not published")
 
+    fetch = fetch or fetch_asset
+
+    def _inline(item):
+        i, a = item
+        return i, *inline_assets(i, a["raw"], prev_files, fetch)
+
+    files = {}
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        for i, raw, assets in pool.map(_inline, list(apps.items())):
+            apps[i]["raw"] = raw
+            files[f"Apps/{i}/docker-compose.yml"] = raw
+            files.update(assets)
+
     def first_list(key):
         for s in sources:
             if loaded.get(s["id"]) and key in loaded[s["id"]]:
                 return loaded[s["id"]][key]
         return json.loads(prev_files.get(key, b"[]"))
-
-    files = {f"Apps/{i}/docker-compose.yml": a["raw"] for i, a in sorted(apps.items())}
     categories = [dict(c) for c in first_list("category-list.json")]
     for cat in sorted({a["category"] for a in apps.values() if isinstance(a["category"], str)} - {c["name"] for c in categories}):
         categories.append({"name": cat, **({"font": CATEGORY_FONTS[cat]} if cat in CATEGORY_FONTS else {}), "description": f"{cat} Apps"})
@@ -253,6 +368,48 @@ def pack(files, out):
     Path(out).write_bytes(buf.getvalue())
 
 
+def store_index(files, report, previous=None):
+    """store-index.json without sha256 — that digest is of the packed zip, so it cannot live inside it."""
+    prev_apps = {}
+    raw = (previous or {}).get("files", {}).get("store-index.json")
+    if raw:
+        try:
+            prev_apps = {a["id"]: a for a in json.loads(raw).get("apps", [])}
+        except (TypeError, ValueError, AttributeError, KeyError):
+            prev_apps = {}
+    apps = []
+    for a in report["apps"]:
+        digest = "sha256:" + hashlib.sha256(files[f"Apps/{a['id']}/docker-compose.yml"]).hexdigest()
+        prev = prev_apps.get(a["id"])
+        if prev and prev.get("content_hash") == digest:
+            revision = int(prev.get("revision") or 1)
+        elif prev and prev.get("revision"):
+            revision = int(prev["revision"]) + 1
+        else:
+            revision = 1
+        apps.append({"id": a["id"], "revision": revision, "content_hash": digest})
+    return {
+        "schema": STORE_SCHEMA, "store_id": STORE_ID, "name": {"en_US": "ReCasaOS catalogue"},
+        "url": STORE_URL, "mirrors": [STORE_MIRROR], "status": "active", "successor": None, "apps": apps,
+    }
+
+
+def write_artifacts(out, files, index):
+    """Pack the zip with an index that omits sha256, then write sibling index + .sha256 of those zip bytes."""
+    out = Path(out)
+    inner = {k: v for k, v in index.items() if k != "sha256"}
+    pack({**files, "store-index.json": dump(inner)}, out)
+    digest = hashlib.sha256(out.read_bytes()).hexdigest()
+    (out.parent / "store-index.json").write_bytes(dump({**inner, "sha256": digest}))
+    out.with_name(out.name + ".sha256").write_text(f"{digest}  {out.name}\n")
+    return digest
+
+
+def write_store(out_dir, files, report, previous=None):
+    """Write recasaos.zip, recasaos.zip.sha256, and store-index.json into out_dir."""
+    write_artifacts(Path(out_dir) / "recasaos.zip", files, store_index(files, report, previous))
+
+
 def read_previous(path):
     if not path or not Path(path).is_file():
         return None
@@ -278,8 +435,9 @@ def main(argv=None):
     a = ap.parse_args(argv)
     sources = json.loads(Path(a.sources).read_text(encoding="utf8"))
     loaded = {i: find_apps(d) for i, _, d in (s.partition("=") for s in a.src)}
+    previous = read_previous(a.previous)
     try:
-        files, report = merge(sources, loaded, read_previous(a.previous),
+        files, report = merge(sources, loaded, previous,
                               check_image_online if a.check_images else (lambda ref: "unknown"), a.min_ratio, a.min_apps)
     except Refused as e:
         print("REFUSED:", e, file=sys.stderr)
@@ -289,7 +447,7 @@ def main(argv=None):
     files["catalogue.json"] = dump({"schema": 1, **report})
     for s in sources:
         files[f"LICENSES/{s['id']}.txt"] = (Path(a.licenses) / f"{s['id']}.txt").read_bytes()
-    pack(files, a.out)
+    write_artifacts(a.out, files, store_index(files, report, previous))
     if a.readme:
         Path(a.readme).write_bytes(text)
     print(f"{len(report['apps'])} apps |", ", ".join(f"{s['id']}: {s['apps']} ({s['status']})" for s in report["sources"]))

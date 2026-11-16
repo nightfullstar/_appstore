@@ -1,14 +1,24 @@
-import json, sys, tempfile, unittest, zipfile
+import hashlib, http.server, json, sys, tempfile, threading, unittest, zipfile
 from pathlib import Path
+
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build
 
 SOURCES = [{"id": i, "name": i, "url": "u", "licence": "MIT"} for i in ("a", "b", "c")]
+PNG = b"\x89PNG\r\n\x1a\n" + b"icon"
+ORG_ZIP = "https://recasaos.org/store/recasaos.zip"
+GITHUB_ZIP = "https://github.com/ReCasaOS/_appstore/releases/latest/download/recasaos.zip"
 
 
-def compose(name, image="nginx:1", category="Media", extra=""):
-    return f"name: {name}\nservices:\n  {name}:\n    image: {image}\n{extra}x-casaos:\n  main: {name}\n  category: {category}\n".encode()
+def compose(name, image="nginx:1", category="Media", extra="", icon=None, screenshots=None):
+    body = f"name: {name}\nservices:\n  {name}:\n    image: {image}\n{extra}x-casaos:\n  main: {name}\n  category: {category}\n"
+    if icon is not None:
+        body += f"  icon: {icon}\n"
+    if screenshots is not None:
+        body += "  screenshot_link:\n" + "".join(f"    - {s}\n" for s in screenshots)
+    return body.encode()
 
 
 def src(*apps, categories=None, recommend=None):
@@ -23,9 +33,13 @@ def src(*apps, categories=None, recommend=None):
 ok = lambda ref: "ok"
 
 
+def run_merge(loaded, previous=None, check=ok, **kw):
+    return build.merge(SOURCES, loaded, previous, check, min_apps=kw.pop("min_apps", 1), **kw)
+
+
 class Merge(unittest.TestCase):
-    def run_merge(self, loaded, previous=None, check=ok, **kw):
-        return build.merge(SOURCES, loaded, previous, check, min_apps=kw.pop("min_apps", 1), **kw)
+    def run_merge(self, *a, **k):
+        return run_merge(*a, **k)
 
     def test_priority_wins_and_losers_are_recorded(self):
         files, rep = self.run_merge({"a": src(("x", {})), "b": src(("x", {"image": "other:1"}), ("y", {}))})
@@ -96,6 +110,122 @@ class Pieces(unittest.TestCase):
             (d / "docker-compose.yml").write_bytes(b"k")
             self.assertEqual(build.find_apps(Path(t) / "x")["apps"], {"app": b"k"})
             self.assertIsNone(build.find_apps(Path(t) / "missing"))
+
+
+class _Assets(http.server.BaseHTTPRequestHandler):
+    routes = {}
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        item = self.routes.get(self.path)
+        if item is None:
+            self.send_error(404)
+            return
+        body, ctype = item
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+class asset_server:
+    def __init__(self, routes):
+        self.routes = routes
+
+    def __enter__(self):
+        _Assets.routes = self.routes
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Assets)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def __exit__(self, *args):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class StorePublish(unittest.TestCase):
+    def test_store_index_fields_and_sibling_digest_match_the_zip(self):
+        files, rep = run_merge({"a": src(("immich", {}))})
+        with tempfile.TemporaryDirectory() as t:
+            build.write_store(t, files, rep)
+            zip_path = Path(t) / "recasaos.zip"
+            zip_bytes = zip_path.read_bytes()
+            digest = hashlib.sha256(zip_bytes).hexdigest()
+            sibling = json.loads((Path(t) / "store-index.json").read_text())
+            self.assertEqual(sibling["schema"], "recasaos.store-index.v1")
+            self.assertEqual(sibling["store_id"], "recasaos-catalogue")
+            self.assertEqual(sibling["url"], ORG_ZIP)
+            self.assertIn(GITHUB_ZIP, sibling["mirrors"])
+            self.assertEqual(sibling["sha256"], digest)
+            self.assertEqual((Path(t) / "recasaos.zip.sha256").read_text(), f"{digest}  recasaos.zip\n")
+            with zipfile.ZipFile(zip_path) as z:
+                inner = json.loads(z.read("store-index.json"))
+            self.assertEqual(inner["schema"], sibling["schema"])
+            self.assertNotIn("sha256", inner)
+            self.assertTrue(sibling["apps"])
+            for app in sibling["apps"]:
+                self.assertEqual(set(app), {"id", "revision", "content_hash"})
+                self.assertEqual(app["id"], "immich")
+                self.assertEqual(app["revision"], 1)
+                self.assertTrue(app["content_hash"].startswith("sha256:"))
+                self.assertEqual(len(app["content_hash"]), len("sha256:") + 64)
+
+    def test_http_icon_is_written_and_compose_rewritten(self):
+        with asset_server({"/icon.png": (PNG, "image/png")}) as base:
+            files, _ = run_merge({"a": src(("immich", {"icon": f"{base}/icon.png"}))})
+        self.assertEqual(files["Apps/immich/icon.png"], PNG)
+        self.assertEqual(yaml.safe_load(files["Apps/immich/docker-compose.yml"])["x-casaos"]["icon"], "icon.png")
+
+    def test_oversize_icon_is_omitted_and_the_app_is_kept(self):
+        big = PNG + b"x" * (128 * 1024)
+        with asset_server({"/icon.png": (big, "image/png")}) as base:
+            files, rep = run_merge({"a": src(("immich", {"icon": f"{base}/icon.png"}))})
+        self.assertEqual([a["id"] for a in rep["apps"]], ["immich"])
+        self.assertFalse(any(p.rsplit("/", 1)[-1].startswith("icon.") for p in files if p.startswith("Apps/immich/")))
+        self.assertEqual(yaml.safe_load(files["Apps/immich/docker-compose.yml"])["x-casaos"]["icon"], "")
+
+    def test_failed_screenshot_is_skipped_and_later_ones_kept(self):
+        shot = b"\x89PNG\r\n\x1a\n" + b"shot"
+        big = shot + b"x" * (512 * 1024)
+        with asset_server({"/big.png": (big, "image/png"), "/ok.png": (shot, "image/png")}) as base:
+            files, _ = run_merge({"a": src(("immich", {"screenshots": [f"{base}/big.png", f"{base}/ok.png"]}))})
+        self.assertEqual(files["Apps/immich/screenshot-1.png"], shot)
+        self.assertNotIn("Apps/immich/screenshot-2.png", files)
+        self.assertEqual(
+            yaml.safe_load(files["Apps/immich/docker-compose.yml"])["x-casaos"]["screenshot_link"],
+            ["screenshot-1.png"],
+        )
+
+    def test_carried_app_keeps_inlined_icon_from_previous_zip(self):
+        with asset_server({"/icon.png": (PNG, "image/png")}) as base:
+            files, _ = run_merge({"a": src(("x", {})), "b": src(("y", {"icon": f"{base}/icon.png"}))})
+        prev = {
+            "manifest": json.loads(build.dump({"apps": [{"id": "x", "source": "a"}, {"id": "y", "source": "b"}]})),
+            "files": files,
+        }
+        files2, rep = run_merge({"a": src(("x", {})), "b": None}, prev)
+        self.assertEqual(rep["sources"][1]["status"], "carried over from the previous build")
+        self.assertEqual(files2["Apps/y/icon.png"], PNG)
+        self.assertEqual(files2["Apps/y/docker-compose.yml"], files["Apps/y/docker-compose.yml"])
+
+    def test_revision_starts_at_1_and_bumps_when_compose_hash_changes(self):
+        files, rep = run_merge({"a": src(("immich", {}))})
+        index = build.store_index(files, rep)
+        self.assertEqual(index["apps"][0]["revision"], 1)
+        prev = {
+            "manifest": {"apps": [{"id": "immich", "source": "a"}]},
+            "files": {**files, "store-index.json": build.dump(index)},
+        }
+        files2, rep2 = run_merge({"a": src(("immich", {}))}, prev)
+        self.assertEqual(build.store_index(files2, rep2, prev)["apps"][0]["revision"], 1)
+        files3, rep3 = run_merge({"a": src(("immich", {"image": "nginx:2"}))}, prev)
+        self.assertEqual(build.store_index(files3, rep3, prev)["apps"][0]["revision"], 2)
 
 
 if __name__ == "__main__":
